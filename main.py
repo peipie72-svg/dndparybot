@@ -2856,13 +2856,69 @@ _RETRYABLE_LLM_ERRORS = (
 )
 
 
+# Допустимые роли сообщений в API DeepSeek (OpenAI-совместимый формат).
+_LLM_ROLES = ("system", "user", "assistant")
+
+
+def _coerce_content(content: Any) -> str:
+    """Приводит content сообщения к простой строке.
+
+    DeepSeek ждёт, что content каждого сообщения — обычная строка (str). Если туда
+    случайно попадёт список/кортеж строк (например, из-за опечатки в константе-промпте,
+    превратившей строку в кортеж), API отвечает 422 «invalid type: string …,
+    expected …ContentBlock». Здесь любой вход безопасно склеивается в строку.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            else:
+                parts.append(str(item))
+        return "".join(parts)
+    if isinstance(content, dict) and isinstance(content.get("text"), str):
+        return content["text"]
+    return str(content)
+
+
+def _normalize_messages(messages: Iterable[Any]) -> list[dict[str, str]]:
+    """Гарантирует валидный для DeepSeek список сообщений.
+
+    Каждый элемент приводится к виду {"role": system|user|assistant, "content": str}:
+    нестандартные роли заменяются (первое сообщение — «system», остальные — «user»),
+    а content всегда становится обычной строкой. Это защищает от 422, возникающих,
+    если content оказался списком/кортежем или роль была не из допустимого набора.
+    """
+    normalized: list[dict[str, str]] = []
+    for index, raw in enumerate(messages):
+        if isinstance(raw, dict):
+            raw_role = str(raw.get("role") or "").strip().lower()
+            content = _coerce_content(raw.get("content"))
+        else:
+            raw_role = ""
+            content = _coerce_content(raw)
+        role = raw_role if raw_role in _LLM_ROLES else ("system" if index == 0 else "user")
+        normalized.append({"role": role, "content": content})
+    return normalized
+
+
 async def _create_chat_completion(messages: list[dict[str, str]]):
     """Отправляет запрос к LLM, повторяя его при временных сбоях.
 
-    Повторы выполняются с экспоненциальной задержкой до LLM_MAX_ATTEMPTS попыток.
+    Перед отправкой сообщения нормализуются (см. _normalize_messages): роли и типы
+    content приводятся к формату, который принимает DeepSeek. Повторы выполняются с
+    экспоненциальной задержкой до LLM_MAX_ATTEMPTS попыток.
     """
     if llm_client is None:
         raise RuntimeError("LLM_API_KEY не задан — клиент LLM недоступен.")
+
+    messages = _normalize_messages(messages)
 
     last_error: Optional[Exception] = None
     for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
@@ -4444,4 +4500,5 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit) as exc:
         if str(exc):
             print(exc)
+
 
