@@ -1,0 +1,4 @@
+aiogram>=3.7
+openai>=1.30
+python-dotenv>=1.0
+pydantic>=2.4
