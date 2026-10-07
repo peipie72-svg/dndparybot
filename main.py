@@ -1755,7 +1755,7 @@ def build_party_sheet(party: "PartySession") -> str:
     Мастер ведёт общий учёт: ему нужно видеть всех героев сразу (кто ранен, чей ход,
     у кого какие ресурсы). Служебный JSON-блок при этом относится к действующему герою.
     """
-    heroes = [ch for ch in party.characters.values() if ch.hero_confirmed]
+    heroes = [(uid, ch) for uid, ch in party.characters.items() if ch.hero_confirmed]
     if not heroes:
         return ""
     lines = [
@@ -1764,10 +1764,22 @@ def build_party_sheet(party: "PartySession") -> str:
         f"Текущая цель: {party.quest}",
         f"Идёт бой: {'да' if party.in_combat else 'нет'}",
         "",
+        "ОТРЯД (обращайся к каждому игроку по его @username; нет тега — зови по имени героя):",
     ]
-    for ch in heroes:
-        lines.append(
-            f"- {hero_summary(ch)}"
+    for uid, ch in heroes:
+        handle = party.player_handle(uid)
+        prefix = f"{handle} — " if handle else ""
+        lines.append(f"- {prefix}{hero_summary(ch)}")
+
+    active_uid = party.active_turn_uid
+    if party.in_combat and active_uid is not None:
+        order = " → ".join(party.address_line(uid) for uid in party.combat_order)
+        lines.extend(
+            [
+                "",
+                f"Порядок ходов боя (инициатива), раунд {party.combat_round}: {order}",
+                f"Сейчас ход: {party.address_line(active_uid)}",
+            ]
         )
     return "\n".join(lines)
 
@@ -2372,6 +2384,7 @@ CREATE TABLE IF NOT EXISTS characters (
     current_hp     INTEGER NOT NULL DEFAULT 0,
     max_hp         INTEGER NOT NULL DEFAULT 0,
     hero_confirmed INTEGER NOT NULL DEFAULT 0,
+    username       TEXT    NOT NULL DEFAULT '',
     updated_at     TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (chat_id, user_id)
 );
@@ -2429,9 +2442,24 @@ class PartyDatabase:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.executescript(DB_SCHEMA)
+        self._migrate(conn)
         conn.commit()
         self._conn = conn
         return conn
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Досыпает недостающие колонки в уже существующую базу (без потери данных).
+
+        Добавлена колонка username (обращение к игрокам по @username в промптах Мастера).
+        Для старых файлов party_database.db CREATE TABLE IF NOT EXISTS ничего не меняет,
+        поэтому новую колонку добавляем через ALTER TABLE.
+        """
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(characters)")}
+        if "username" not in columns:
+            conn.execute(
+                "ALTER TABLE characters ADD COLUMN username TEXT NOT NULL DEFAULT ''"
+            )
 
     def init(self) -> None:
         """Создаёт файл базы, таблицы и индексы (идемпотентно)."""
@@ -2488,24 +2516,35 @@ class PartyDatabase:
 
     # --- таблица characters ---
 
-    def save_character(self, chat_id: int, user_id: int, character: Character) -> None:
+    def save_character(
+        self,
+        chat_id: int,
+        user_id: int,
+        character: Character,
+        username: str = "",
+    ) -> None:
         """Сохраняет (или обновляет) лист героя игрока в партии чата.
 
         Весь лист лежит в JSON-колонке data, а ключевые поля (имя, вид, класс, уровень,
         HP, подтверждение) дублируются в колонки для удобного чтения SQL-запросами.
+        ``username`` — @username игрока (без «@»), чтобы Мастер мог обращаться к нему
+        по тегу. Пустое значение НЕ затирает уже сохранённый тег (см. CASE в ON CONFLICT).
         """
         with self._lock:
             conn = self._connect()
             conn.execute(
                 "INSERT INTO characters "
                 "(chat_id, user_id, data, name, race, class_name, level, current_hp, max_hp, "
-                " hero_confirmed, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                " hero_confirmed, username, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
                 "ON CONFLICT(chat_id, user_id) DO UPDATE SET "
                 "data = excluded.data, name = excluded.name, race = excluded.race, "
                 "class_name = excluded.class_name, level = excluded.level, "
                 "current_hp = excluded.current_hp, max_hp = excluded.max_hp, "
-                "hero_confirmed = excluded.hero_confirmed, updated_at = CURRENT_TIMESTAMP",
+                "hero_confirmed = excluded.hero_confirmed, "
+                "username = CASE WHEN excluded.username <> '' "
+                "THEN excluded.username ELSE characters.username END, "
+                "updated_at = CURRENT_TIMESTAMP",
                 (
                     int(chat_id),
                     int(user_id),
@@ -2517,9 +2556,23 @@ class PartyDatabase:
                     character.current_hp,
                     character.max_hp,
                     1 if character.hero_confirmed else 0,
+                    (username or "").strip().lstrip("@"),
                 ),
             )
             conn.commit()
+
+    def load_usernames(self, chat_id: int) -> dict[int, str]:
+        """Возвращает сохранённые @username игроков партии: {user_id: username}."""
+        with self._lock:
+            rows = self._connect().execute(
+                "SELECT user_id, username FROM characters WHERE chat_id = ?",
+                (int(chat_id),),
+            ).fetchall()
+        return {
+            int(row["user_id"]): str(row["username"] or "").strip().lstrip("@")
+            for row in rows
+            if str(row["username"] or "").strip()
+        }
 
     def load_character(self, chat_id: int, user_id: int) -> Optional[Character]:
         """Возвращает сохранённый лист героя или None, если игрок ещё не в отряде."""
@@ -2658,6 +2711,7 @@ class PartySession:
     __slots__ = (
         "chat_id",
         "characters",
+        "usernames",
         "location",
         "quest",
         "in_combat",
@@ -2665,6 +2719,9 @@ class PartySession:
         "history",
         "combat_start",
         "combat_first_db_id",
+        "combat_order",
+        "combat_turn",
+        "combat_round",
         "_last_db_id",
     )
 
@@ -2672,6 +2729,8 @@ class PartySession:
         self.chat_id: int = int(chat_id)
         # user_id -> Character: свой герой у каждого игрока отряда.
         self.characters: dict[int, Character] = {}
+        # user_id -> @username (без «@»): нужен Мастеру, чтобы обращаться к игрокам по тегу.
+        self.usernames: dict[int, str] = {}
         self.location: str = DEFAULT_LOCATION
         self.quest: str = DEFAULT_QUEST
         self.in_combat: bool = False
@@ -2680,6 +2739,12 @@ class PartySession:
         self.history: list[dict[str, Any]] = []
         self.combat_start: Optional[int] = None
         self.combat_first_db_id: Optional[int] = None
+        # Строгий трекер ходов боя (инициатива героев):
+        # combat_order — user_id в порядке инициативы; combat_turn — чей сейчас ход;
+        # combat_round — номер раунда.
+        self.combat_order: list[int] = []
+        self.combat_turn: int = 0
+        self.combat_round: int = 1
         self._last_db_id: Optional[int] = None
 
     @classmethod
@@ -2693,6 +2758,7 @@ class PartySession:
             session.in_combat = campaign.in_combat
             session.started = campaign.started
         session.characters = db.load_party(chat_id)
+        session.usernames = db.load_usernames(chat_id)
         for message in db.load_history(chat_id):
             session.history.append(message)
         session._last_db_id = db.last_message_id(chat_id)
@@ -2718,15 +2784,105 @@ class PartySession:
         """Только подтверждённые герои (участники текущего приключения)."""
         return {uid: ch for uid, ch in self.characters.items() if ch.hero_confirmed}
 
+    # --- обращение к игрокам (@username) ---
+
+    def remember_username(
+        self, user_id: int, username: Optional[str], full_name: str = ""
+    ) -> None:
+        """Запоминает @username игрока, чтобы Мастер мог обращаться к нему по тегу.
+
+        Telegram отдаёт username без «@»; храним его в нормализованном виде. Если у игрока
+        username нет (он его скрыл), запоминаем пустое значение — тогда Мастер обратится
+        по имени героя. Значение сразу уходит в базу (переживает перезапуск бота).
+        """
+        uid = int(user_id)
+        clean = (username or "").strip().lstrip("@")
+        if not clean:
+            return
+        if self.usernames.get(uid) == clean:
+            return
+        self.usernames[uid] = clean
+        character = self.characters.get(uid)
+        if character is not None:
+            db.save_character(self.chat_id, uid, character, username=clean)
+
+    def player_handle(self, user_id: Optional[int]) -> str:
+        """Возвращает «@username» игрока или пустую строку, если тега нет."""
+        if user_id is None:
+            return ""
+        username = self.usernames.get(int(user_id), "")
+        return f"@{username}" if username else ""
+
+    def address_line(self, user_id: Optional[int]) -> str:
+        """Как обращаться к игроку: «@username (ИмяГероя)» либо только имя героя."""
+        handle = self.player_handle(user_id)
+        character = self.characters.get(int(user_id)) if user_id is not None else None
+        hero_name = character.name if character is not None else ""
+        if handle and hero_name:
+            return f"{handle} ({hero_name})"
+        return handle or hero_name or "игрок"
+
+    # --- строгий трекер ходов боя (инициатива) ---
+
+    @property
+    def active_turn_uid(self) -> Optional[int]:
+        """user_id игрока, чей сейчас ход в бою (или None, если бой не идёт)."""
+        if not self.in_combat or not self.combat_order:
+            return None
+        index = max(0, min(self.combat_turn, len(self.combat_order) - 1))
+        return self.combat_order[index]
+
+    def _roll_initiative(self) -> None:
+        """Бросает инициативу всем подтверждённым героям (d20 + модификатор ЛОВ)."""
+        heroes = list(self.confirmed_heroes().items())
+        rolled = [
+            (_rng.randint(1, 20) + character.initiative, uid)
+            for uid, character in heroes
+        ]
+        # Сортировка по итогу инициативы (при равенстве — по user_id для стабильности).
+        rolled.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        self.combat_order = [uid for _total, uid in rolled]
+        self.combat_turn = 0
+        self.combat_round = 1
+
+    def advance_turn(self) -> None:
+        """Передаёт ход следующему герою по инициативе (с новым раундом после круга)."""
+        if not self.combat_order:
+            return
+        self.combat_turn += 1
+        if self.combat_turn >= len(self.combat_order):
+            self.combat_turn = 0
+            self.combat_round += 1
+
+    def turn_announcement(self) -> str:
+        """Объявление начала хода в бою: «⚔️ Раунд X. Ход @username (Имя)! …»."""
+        uid = self.active_turn_uid
+        if uid is None:
+            return ""
+        return COMBAT_TURN_ANNOUNCE_TEMPLATE.format(
+            round_number=self.combat_round,
+            mention=self.address_line(uid),
+        )
+
+    def waiting_for_turn_text(self) -> str:
+        """Ответ игроку, который действует вне своей очереди в бою."""
+        uid = self.active_turn_uid
+        return COMBAT_WAITING_TEMPLATE.format(mention=self.address_line(uid))
+
     def is_full(self) -> bool:
         """Достигнут ли предел размера отряда."""
         return len(self.characters) >= MAX_PARTY_SIZE
 
     def save_character(self, user_id: int) -> None:
-        """Сохраняет лист конкретного героя в базу."""
+        """Сохраняет лист конкретного героя в базу (вместе с @username игрока)."""
         character = self.characters.get(int(user_id))
         if character is not None:
-            db.save_character(self.chat_id, int(user_id), character)
+            db.save_character(
+                self.chat_id,
+                int(user_id),
+                character,
+                username=self.usernames.get(int(user_id), ""),
+            )
 
     def save_campaign(self) -> None:
         """Сохраняет общее состояние партии (локация, цель, бой, started) в базу."""
@@ -2763,10 +2919,16 @@ class PartySession:
         )
 
     def _format_history_entry(self, entry: dict[str, Any]) -> dict[str, str]:
-        """Готовит запись истории к отправке в API (ярлык игрока для реплик партии)."""
+        """Готовит запись истории к отправке в API (ярлык игрока для реплик партии).
+
+        Ярлык включает @username игрока, если он известен: «[Игрок @user — Имя (Вид Класс)]».
+        Это нужно Мастеру, чтобы обращаться к игроку по тегу в ответе.
+        """
         content = entry.get("content", "")
         if entry.get("role") == "user" and entry.get("char_name"):
-            content = f"[Игрок {entry['char_name']}]: {content}"
+            handle = self.player_handle(entry.get("user_id"))
+            label = f"{handle} — {entry['char_name']}" if handle else entry["char_name"]
+            content = f"[Игрок {label}]: {content}"
         return {"role": entry.get("role", "user"), "content": content}
 
     def messages(self) -> list[dict[str, str]]:
@@ -2792,10 +2954,14 @@ class PartySession:
         return [self._format_history_entry(entry) for entry in window]
 
     def begin_combat(self) -> None:
-        """Помечает начало боя: с этого момента messages() не обрезает историю."""
+        """Помечает начало боя: с этого момента messages() не обрезает историю.
+
+        Здесь же бросается инициатива героев и запускается строгий трекер ходов.
+        """
         self.in_combat = True
         self.combat_start = len(self.history) - 1 if self.history else 0
         self.combat_first_db_id = self._last_db_id
+        self._roll_initiative()
 
     def end_combat(self, summary: str) -> None:
         """Завершает бой: сворачивает подробную боевую цепочку в одну строку-резюме."""
@@ -2810,6 +2976,9 @@ class PartySession:
         self.history = self.history[:start] + [note]
         self.in_combat = False
         self.combat_start = None
+        self.combat_order = []
+        self.combat_turn = 0
+        self.combat_round = 1
         if self.combat_first_db_id:
             db.delete_messages_after(self.chat_id, self.combat_first_db_id)
         self._last_db_id = db.append_message(self.chat_id, note["role"], note["content"])
@@ -2818,6 +2987,7 @@ class PartySession:
     def reset(self) -> None:
         """Полностью очищает партию чата (память + база)."""
         self.characters.clear()
+        self.usernames.clear()
         self.location = DEFAULT_LOCATION
         self.quest = DEFAULT_QUEST
         self.in_combat = False
@@ -2825,6 +2995,9 @@ class PartySession:
         self.history.clear()
         self.combat_start = None
         self.combat_first_db_id = None
+        self.combat_order = []
+        self.combat_turn = 0
+        self.combat_round = 1
         self._last_db_id = None
         db.reset_party(self.chat_id)
 
@@ -3388,6 +3561,15 @@ COMBAT_CONTINUATION_NOTE = (
     "\"battle_summary\" с кратким итогом схватки."
 )
 
+# Объявление начала хода в бою: «⚔️ Раунд X. Ход @username (Имя)! Твоя очередь действовать.»
+COMBAT_TURN_ANNOUNCE_TEMPLATE = "⚔️ Раунд {round_number}. Ход {mention}! Твоя очередь действовать."
+
+# Отклонение действия вне своей очереди: «⏳ Сейчас ход @username (Имя), дождитесь своей очереди.»
+COMBAT_WAITING_TEMPLATE = "⏳ Сейчас ход {mention}, дождитесь своей очереди."
+
+# Маркеры реакции: заявку с этими словами в бою разрешаем вне своей очереди (реакция).
+COMBAT_REACTION_MARKERS = ("реакц", "reaction")
+
 
 def _control_flag_to_bool(value: Any) -> Optional[bool]:
     """Приводит значение флага из служебного блока к bool/None (терпимо к строкам)."""
@@ -3564,11 +3746,20 @@ async def _answer_with_dungeon_master(
 
     _update_combat_state(party, control, reply, was_in_combat)
 
+    # Строгий трекер ходов: если бой уже шёл и действовал активный герой — передаём слово дальше.
+    just_began_combat = (not was_in_combat) and party.in_combat
+    if party.in_combat and not just_began_combat and party.active_turn_uid == uid:
+        party.advance_turn()
+
     party.add("assistant", reply)
 
     outgoing = reply
+    if party.in_combat:
+        turn_line = party.turn_announcement()
+        if turn_line:
+            outgoing = f"{outgoing}\n\n{turn_line}"
     if actor.hero_confirmed:
-        outgoing = f"{format_hud(party.location, party.quest)}\n\n{reply}"
+        outgoing = f"{format_hud(party.location, party.quest)}\n\n{outgoing}"
     if out_chat == message.chat.id:
         await send_long_message(message, outgoing, reply_markup=phase_keyboard(actor, uid))
     else:
@@ -3845,6 +4036,7 @@ async def _deliver_hero_to_group(
 
     actor.hero_confirmed = True
     target_party.characters[uid] = actor
+    target_party.remember_username(uid, username, full_name)
     target_party.save_character(uid)
 
     others = [ch.name for ch in target_party.confirmed_heroes().values() if ch is not actor]
@@ -3924,7 +4116,17 @@ async def _require_actor(
     if actor is None:
         await callback.answer(NOT_IN_PARTY_TEXT, show_alert=True)
         return None
+    if callback.from_user is not None:
+        party.remember_username(
+            uid, callback.from_user.username, callback.from_user.full_name
+        )
     return message, uid, party, actor
+
+
+def _is_combat_reaction(text: str) -> bool:
+    """True, если заявка игрока — это реакция (её в бою разрешаем вне своей очереди)."""
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in COMBAT_REACTION_MARKERS)
 
 
 def _is_group_chat(chat_type: str) -> bool:
@@ -3982,6 +4184,7 @@ async def handle_join(message: Message) -> None:
 
     party = get_party(message.chat.id)
     uid = message.from_user.id
+    party.remember_username(uid, message.from_user.username, message.from_user.full_name)
 
     actor = party.character_for(uid)
     if actor is not None and actor.hero_confirmed:
@@ -4135,6 +4338,7 @@ async def handle_roll(message: Message, command: CommandObject) -> None:
         return
     party = get_party(message.chat.id)
     uid = message.from_user.id
+    party.remember_username(uid, message.from_user.username, message.from_user.full_name)
     actor = party.character_for(uid)
     if actor is None:
         await message.answer(NOT_IN_PARTY_TEXT)
@@ -4236,6 +4440,7 @@ async def handle_player_action(message: Message) -> None:
 
     party = get_party(message.chat.id)
     uid = message.from_user.id
+    party.remember_username(uid, message.from_user.username, message.from_user.full_name)
     actor = party.character_for(uid)
     if actor is None:
         hint = _private_hint_for(uid) if message.chat.type == "private" else NOT_IN_PARTY_TEXT
@@ -4244,6 +4449,18 @@ async def handle_player_action(message: Message) -> None:
 
     # Герой подтверждён — это обычное действие персонажа.
     if actor.hero_confirmed:
+        # В бою действует строгая очередь по инициативе: заявку вне своего хода отклоняем
+        # (кроме реакции). В личных сообщениях очередь не проверяем — бой идёт в группе.
+        if (
+            message.chat.type != "private"
+            and party.in_combat
+            and uid in party.combat_order
+            and party.active_turn_uid is not None
+            and uid != party.active_turn_uid
+            and not _is_combat_reaction(text)
+        ):
+            await message.answer(party.waiting_for_turn_text())
+            return
         party.add("user", text, user_id=uid, char_name=character_label(actor))
         await _answer_with_dungeon_master(message, party, actor, uid)
         return
