@@ -19,6 +19,7 @@ Telegram-бот «Dungeon Master» для настольной ролевой и
     /spells      — книга заклинаний своего персонажа
     /rest        — отдых: восстановление HP и ячеек
     /reset_party — СБРОС всей партии в этом чате (только администраторы)
+    /cancel      — в ЛС: сброс ЛИЧНОГО черновика создания героя (синоним /reset_draft)
 
 Бот отвечает в группе ТОЛЬКО когда его позвали: упоминание @бота, ответ на сообщение бота
 или команда. Служебный JSON-блок Мастера относится к тому герою, чей игрок только что действовал.
@@ -330,6 +331,28 @@ PRIVATE_HERO_ALREADY_TEXT = (
 PRIVATE_HERO_NO_TARGET_TEXT = (
     "🐉 Создание персонажа начинается из группового чата: напиши «/join» в беседе отряда "
     "и перейди по кнопке «👤 Создать персонажа в ЛС»."
+)
+
+# Личка: личный черновик создания героя сброшен (команды /cancel и /reset_draft).
+PRIVATE_DRAFT_RESET_TEXT = (
+    "🔄 Черновик персонажа сброшен!\n"
+    "Если вы создавали героя для беседы — вернитесь в группу и нажмите /join снова.\n"
+    "Или нажмите кнопку ниже, чтобы начать заново."
+)
+
+# Кнопка перезапуска диалога генерации героя прямо в ЛС (callback «draft:restart:<uid>»).
+RESTART_CREATION_BUTTON_TEXT = "🔄 Начать создание заново"
+
+# Кнопка с deep-link: заново создать героя для той же беседы (привязка к группе известна).
+RESTART_CREATION_GROUP_BUTTON_TEXT = "👥 Создать героя для беседы заново"
+
+# Кнопка отмены черновика прямо в клавиатуре подтверждения персонажа («draft:reset:<uid>»).
+CANCEL_CREATION_BUTTON_TEXT = "❌ Начать заново"
+
+# Подсказка, если сброс черновика вызвали не в личных сообщениях.
+DRAFT_RESET_PRIVATE_ONLY_TEXT = (
+    "🔄 Сброс черновика доступен в личных сообщениях бота. "
+    "В беседе используйте /join, чтобы создать героя заново."
 )
 
 # Торжественное объявление в группе о прибытии нового героя.
@@ -3314,7 +3337,11 @@ def build_rest_keyboard(character: Character, uid: int) -> InlineKeyboardMarkup:
 
 
 def build_creation_keyboard(uid: int) -> InlineKeyboardMarkup:
-    """Кнопки этапа создания персонажа: пока герой не подтверждён, показываем именно их."""
+    """Кнопки этапа создания персонажа: пока герой не подтверждён, показываем именно их.
+
+    Кроме подтверждения/случайного героя есть кнопка «❌ Начать заново»: она сбрасывает
+    незавершённый черновик этого игрока и заново запускает генерацию героя.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -3323,6 +3350,10 @@ def build_creation_keyboard(uid: int) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="📜 Лист", callback_data=_cb("sheet", uid)),
+                InlineKeyboardButton(
+                    text=CANCEL_CREATION_BUTTON_TEXT,
+                    callback_data=_cb("draft", uid, "reset"),
+                ),
             ],
         ]
     )
@@ -3675,6 +3706,68 @@ async def _confirm_hero_and_start_prologue(
     )
     logger.info("Чат %s: игрок %s подтвердил героя «%s»", party.chat_id, uid, actor.name)
     await _answer_with_dungeon_master(message, party, actor, uid)
+
+
+def _reset_private_draft(chat_id: int, uid: int, *, drop_target: bool) -> Optional[int]:
+    """Полностью очищает ЛИЧНЫЙ черновик создания героя этого игрока.
+
+    Затрагивает только партию личного чата (``chat_id``) и привязку ``_join_targets[uid]``:
+    кампания группового чата и герои других игроков НЕ трогаются ни при каких условиях.
+
+    ``drop_target=True`` — вместе с черновиком снимается привязка к целевой группе (игрок
+    отменяет создание героя для беседы, см. /cancel). ``drop_target=False`` — привязка
+    сохраняется, чтобы новый герой снова уехал в ту же беседу (кнопка «Начать заново»).
+    Возвращает ранее сохранённый ``target_chat_id`` (chat_id группы) либо None.
+    """
+    uid = int(uid)
+    chat_id = int(chat_id)
+    previous_target = _join_targets.get(uid)
+
+    party = _parties.get(chat_id)
+    if party is None:
+        # Черновика нет в памяти (например, после перезапуска) — поднимаем из базы.
+        party = PartySession.restore(chat_id)
+    party.characters.pop(uid, None)
+    party.reset()
+    _parties.pop(chat_id, None)
+
+    if drop_target:
+        _join_targets.pop(uid, None)
+    return previous_target
+
+
+async def _restart_hero_creation(message: Message, uid: int) -> None:
+    """Сбрасывает текущий черновик игрока и заново запускает диалог создания героя.
+
+    В личном чате очищается персональный черновик целиком; в группе — только незавершённый
+    герой этого игрока (кампания группы и остальные игроки не затрагиваются). Привязка к
+    целевой группе (для «Вариант Б») сохраняется, чтобы новый герой снова уехал в беседу.
+    """
+    uid = int(uid)
+    chat_id = message.chat.id
+    target_chat_id = _join_targets.get(uid)
+
+    if message.chat.type == "private":
+        _reset_private_draft(chat_id, uid, drop_target=False)
+        logger.info("ЛС %s: игрок %s начал создание героя заново", chat_id, uid)
+        if target_chat_id is not None:
+            # Герой по-прежнему создаётся для группы — продолжаем «Вариант Б».
+            await _start_private_hero_creation(message, uid, target_chat_id)
+            return
+        party = get_party(chat_id)
+        actor = party.ensure_character(uid)
+        await _begin_hero_creation(message, party, actor, uid)
+        return
+
+    # Групповой чат: убираем только черновик этого игрока, партию не трогаем.
+    party = get_party(chat_id)
+    actor = party.character_for(uid)
+    if actor is not None and not actor.hero_confirmed:
+        party.characters.pop(uid, None)
+        db.delete_character(chat_id, uid)
+    actor = party.ensure_character(uid)
+    logger.info("Чат %s: игрок %s начал создание героя заново", chat_id, uid)
+    await _begin_hero_creation(message, party, actor, uid)
 
 
 async def _start_private_hero_creation(
@@ -4077,6 +4170,53 @@ async def handle_reset_party(message: Message) -> None:
     )
 
 
+@router.message(Command("cancel", "reset_draft"))
+async def handle_cancel_draft(message: Message) -> None:
+    """/cancel (и синоним /reset_draft) — сброс ЛИЧНОГО черновика создания героя в ЛС.
+
+    Команда действует только в личных сообщениях и трогает лишь черновик этого игрока:
+    партия группы и герои других игроков не затрагиваются. Привязка к беседе
+    (_join_targets) снимается; если игрок создавал героя для группы, ему предлагается
+    кнопка-ссылка, чтобы вернуться и создать героя заново.
+    """
+    if message.from_user is None:
+        return
+    if message.chat.type != "private":
+        await message.answer(DRAFT_RESET_PRIVATE_ONLY_TEXT)
+        return
+
+    uid = message.from_user.id
+    previous_target = _reset_private_draft(message.chat.id, uid, drop_target=True)
+    logger.info(
+        "ЛС %s: игрок %s сбросил черновик персонажа (прежняя цель: %s)",
+        message.chat.id,
+        uid,
+        previous_target,
+    )
+
+    rows: list[list[InlineKeyboardButton]] = []
+    if previous_target is not None and BOT_USERNAME:
+        # Игрок создавал героя для беседы — даём кнопку-ссылку вернуться и создать заново.
+        url = f"https://t.me/{BOT_USERNAME}?start=join_{int(previous_target)}"
+        rows.append(
+            [InlineKeyboardButton(text=RESTART_CREATION_GROUP_BUTTON_TEXT, url=url)]
+        )
+    else:
+        # Привязки к группе нет — просто заново запускаем генерацию героя в ЛС.
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=RESTART_CREATION_BUTTON_TEXT,
+                    callback_data=_cb("draft", uid, "restart"),
+                )
+            ]
+        )
+    await message.answer(
+        PRIVATE_DRAFT_RESET_TEXT,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
 @router.message(F.text & ~F.text.startswith("/"))
 async def handle_player_action(message: Message) -> None:
     """Текстовое сообщение: создание героя, подтверждение или действие персонажа.
@@ -4186,6 +4326,21 @@ async def handle_unsupported(message: Message) -> None:
 async def handle_callback(callback: CallbackQuery) -> None:
     """Единый диспетчер инлайн-кнопок: проверяет владельца и разводит по действиям."""
     action, param, _owner = _parse_callback(callback.data or "")
+
+    # --- сброс/перезапуск черновика создания персонажа («❌ Начать заново») ---
+    if action == "draft":
+        target = _callback_context(callback)
+        if target is None:
+            await callback.answer(STALE_CALLBACK_TEXT, show_alert=True)
+            return
+        message, uid = target
+        _, _, owner = _parse_callback(callback.data or "")
+        if owner is not None and owner != uid:
+            await callback.answer(NOT_YOUR_BUTTON_TEXT, show_alert=True)
+            return
+        await callback.answer()
+        await _restart_hero_creation(message, uid)
+        return
 
     # --- этап создания персонажа ---
     if action == "hero":
@@ -4434,6 +4589,7 @@ BOT_COMMANDS = [
     BotCommand(command="spells", description="Книга заклинаний: ячейки, применение, подготовка"),
     BotCommand(command="rest", description="Отдых: восстановить HP и ячейки заклинаний"),
     BotCommand(command="reset_party", description="Сбросить партию чата (администраторы)"),
+    BotCommand(command="cancel", description="Сбросить черновик персонажа (в личных сообщениях)"),
 ]
 
 
